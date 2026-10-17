@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 
+import '../analysis/anomaly_model.dart';
 import '../data/models.dart';
 import '../data/repo.dart';
 import 'device.dart';
@@ -14,8 +15,11 @@ const samplingOptions = [10.0, 20.0, 50.0];
 Duration periodFor(double hz) => Duration(microseconds: (1e6 / hz).round());
 
 /// Promedia el acelerómetro durante [duration] para fijar la referencia.
-Future<Calibration?> calibrate(SensorSources src,
-    {Duration duration = const Duration(seconds: 2), double hz = 50}) async {
+Future<Calibration?> calibrate(
+  SensorSources src, {
+  Duration duration = const Duration(seconds: 2),
+  double hz = 50,
+}) async {
   final readings = <Vec3>[];
   final sub = src.accelerometer(periodFor(hz)).listen((r) => readings.add(r.v));
   try {
@@ -31,8 +35,16 @@ class LiveReading {
   final Vec3? lin, gyro;
   final Tilt tilt;
   final double deltaRef, deltaLateral, deltaFrontal;
-  const LiveReading(this.acc, this.gravity, this.lin, this.gyro, this.tilt,
-      this.deltaRef, this.deltaLateral, this.deltaFrontal);
+  const LiveReading(
+    this.acc,
+    this.gravity,
+    this.lin,
+    this.gyro,
+    this.tilt,
+    this.deltaRef,
+    this.deltaLateral,
+    this.deltaFrontal,
+  );
 }
 
 enum RecState { paused, recording, finished }
@@ -48,6 +60,8 @@ class SessionRecorder extends ChangeNotifier {
   final double hz;
   final SensorSources src;
   final bool useLinear, useGyro;
+  final ValueChanged<double>? onRiesgoDetectado;
+  final Future<double> Function(List<Vec3>) modelPredictor;
 
   SessionRecorder({
     required this.repo,
@@ -57,27 +71,42 @@ class SessionRecorder extends ChangeNotifier {
     required this.src,
     this.useLinear = true,
     this.useGyro = true,
+    this.onRiesgoDetectado,
+    this.modelPredictor = AnomalyModel.predict,
     Duration previouslyActive = Duration.zero,
   }) : _active = previouslyActive;
 
   static const chartWindow = Duration(seconds: 30);
   static const stallAfter = Duration(seconds: 3);
+  static const _probabilidadRiesgo = AnomalyModel.anomalyThreshold;
+  final int lecturasRequeridas = 5;
 
   final _filter = GravityFilter();
   final _buffer = <Sample>[];
-  final recent = <({DateTime t, double dLateral, double dFrontal, double lin})>[];
+  final _modelWindow = <Vec3>[];
+  final recent =
+      <({DateTime t, double dLateral, double dFrontal, double lin})>[];
   final _subs = <StreamSubscription>[];
   Timer? _tick;
   Vec3? _lin, _gyro;
-  DateTime? _segmentStart, _lastSample, _lastNotify, _lastStored;
+  DateTime? _segmentStart,
+      _lastSample,
+      _lastNotify,
+      _lastStored,
+      _lastModelSample;
   Duration _active;
   bool _flushing = false, _disposed = false;
+  bool _modelRunning = false;
+  List<Vec3>? _queuedModelWindow;
+  int contadorRiesgoConsecutivo = 0;
 
   RecState state = RecState.paused;
   LiveReading? live;
   int saved = 0, invalid = 0;
   double peakLin = 0;
-  String? error, warning;
+  double? modelScore;
+  bool riesgoSostenido = false;
+  String? error, warning, modelError;
 
   Duration get active => _segmentStart == null
       ? _active
@@ -89,23 +118,49 @@ class SessionRecorder extends ChangeNotifier {
     error = warning = null;
     _filter.reset();
     _lastStored = null;
+    _lastModelSample = null;
+    _modelWindow.clear();
+    _queuedModelWindow = null;
+    modelScore = null;
+    contadorRiesgoConsecutivo = 0;
+    riesgoSostenido = false;
+    modelError = null;
     final period = periodFor(hz);
-    _subs.add(src.accelerometer(period).listen(_onAcc,
-        onError: (Object e) => _fail('Error del acelerómetro: $e'),
-        onDone: () => _fail('El acelerómetro dejó de enviar datos.')));
+    _subs.add(
+      src
+          .accelerometer(period)
+          .listen(
+            _onAcc,
+            onError: (Object e) => _fail('Error del acelerómetro: $e'),
+            onDone: () => _fail('El acelerómetro dejó de enviar datos.'),
+          ),
+    );
     if (useLinear) {
-      _subs.add(src.linearAcceleration(period).listen((r) => _lin = r.v,
-          onError: (Object _) {
-        _lin = null;
-        warning = 'Aceleración lineal no disponible; se continúa sin ella.';
-      }));
+      _subs.add(
+        src
+            .linearAcceleration(period)
+            .listen(
+              (r) => _lin = r.v,
+              onError: (Object _) {
+                _lin = null;
+                warning =
+                    'Aceleración lineal no disponible; se continúa sin ella.';
+              },
+            ),
+      );
     }
     if (useGyro) {
-      _subs.add(src.gyroscope(period).listen((r) => _gyro = r.v,
-          onError: (Object _) {
-        _gyro = null;
-        warning = 'Giroscopio no disponible; se continúa sin él.';
-      }));
+      _subs.add(
+        src
+            .gyroscope(period)
+            .listen(
+              (r) => _gyro = r.v,
+              onError: (Object _) {
+                _gyro = null;
+                warning = 'Giroscopio no disponible; se continúa sin él.';
+              },
+            ),
+      );
     }
     _segmentStart = _lastSample = DateTime.now();
     _tick = Timer.periodic(const Duration(seconds: 1), (_) => _onTick());
@@ -121,6 +176,17 @@ class SessionRecorder extends ChangeNotifier {
       invalid++;
       return;
     }
+    final lastModel = _lastModelSample;
+    if (lastModel == null ||
+        r.t.difference(lastModel) >= AnomalyModel.samplePeriod * 0.9) {
+      _lastModelSample = r.t;
+      _modelWindow.add(r.v);
+      if (_modelWindow.length == AnomalyModel.windowSize) {
+        final window = List<Vec3>.of(_modelWindow);
+        _modelWindow.clear();
+        unawaited(_classifyWindow(window));
+      }
+    }
     // Android trata el periodo como una sugerencia y suele entregar más
     // lecturas de las pedidas: todas alimentan el filtro, pero solo se guardan
     // las que respetan la frecuencia elegida (tolerancia del 10 %).
@@ -130,23 +196,39 @@ class SessionRecorder extends ChangeNotifier {
     final tilt = Tilt.fromGravity(g);
     final ref = reference.tilt;
     final lin = _lin, gyro = _gyro;
-    _buffer.add(Sample(
-      t: r.t,
-      accX: r.v.x, accY: r.v.y, accZ: r.v.z,
-      linX: lin?.x, linY: lin?.y, linZ: lin?.z,
-      gyroX: gyro?.x, gyroY: gyro?.y, gyroZ: gyro?.z,
-      inclLateral: tilt.lateral,
-      inclFrontal: tilt.frontal,
-    ));
+    _buffer.add(
+      Sample(
+        t: r.t,
+        accX: r.v.x,
+        accY: r.v.y,
+        accZ: r.v.z,
+        linX: lin?.x,
+        linY: lin?.y,
+        linZ: lin?.z,
+        gyroX: gyro?.x,
+        gyroY: gyro?.y,
+        gyroZ: gyro?.z,
+        inclLateral: tilt.lateral,
+        inclFrontal: tilt.frontal,
+      ),
+    );
     _lastSample = DateTime.now();
-    live = LiveReading(r.v, g, lin, gyro, tilt, angleBetween(g, reference.gravity),
-        tilt.lateral - ref.lateral, tilt.frontal - ref.frontal);
+    live = LiveReading(
+      r.v,
+      g,
+      lin,
+      gyro,
+      tilt,
+      angleBetween(g, reference.gravity),
+      tilt.lateral - ref.lateral,
+      tilt.frontal - ref.frontal,
+    );
     if (lin != null && lin.norm > peakLin) peakLin = lin.norm;
     recent.add((
       t: r.t,
       dLateral: live!.deltaLateral,
       dFrontal: live!.deltaFrontal,
-      lin: lin?.norm ?? 0
+      lin: lin?.norm ?? 0,
     ));
     while (recent.isNotEmpty && r.t.difference(recent.first.t) > chartWindow) {
       recent.removeAt(0);
@@ -160,11 +242,46 @@ class SessionRecorder extends ChangeNotifier {
     }
   }
 
+  Future<void> _classifyWindow(List<Vec3> window) async {
+    if (modelError != null || _disposed) return;
+    if (_modelRunning) {
+      _queuedModelWindow = window;
+      return;
+    }
+    _modelRunning = true;
+    List<Vec3>? current = window;
+    try {
+      while (current != null) {
+        modelScore = await modelPredictor(current);
+        if (modelScore! > _probabilidadRiesgo) {
+          contadorRiesgoConsecutivo++;
+          if (contadorRiesgoConsecutivo >= lecturasRequeridas) {
+            riesgoSostenido = true;
+            contadorRiesgoConsecutivo = 0;
+            onRiesgoDetectado?.call(modelScore!);
+          }
+        } else {
+          contadorRiesgoConsecutivo = 0;
+          riesgoSostenido = false;
+        }
+        current = _queuedModelWindow;
+        _queuedModelWindow = null;
+      }
+    } catch (e) {
+      modelError = 'No se pudo ejecutar el modelo de anomalías: $e';
+      _queuedModelWindow = null;
+    } finally {
+      _modelRunning = false;
+      notifyListeners();
+    }
+  }
+
   Future<void> _onTick() async {
     await flush();
     if (state == RecState.recording &&
         DateTime.now().difference(_lastSample!) > stallAfter) {
-      warning = 'Sin datos del acelerómetro en los últimos '
+      warning =
+          'Sin datos del acelerómetro en los últimos '
           '${stallAfter.inSeconds} s.';
     }
     notifyListeners();
@@ -216,10 +333,13 @@ class SessionRecorder extends ChangeNotifier {
       await Future<void>.delayed(const Duration(milliseconds: 10));
     }
     await flush();
-    await repo.closeSession(sessionId, SessionStatus.completed,
-        endedAt: DateTime.now(),
-        activeSeconds: _active.inMilliseconds / 1000,
-        notes: notes);
+    await repo.closeSession(
+      sessionId,
+      SessionStatus.completed,
+      endedAt: DateTime.now(),
+      activeSeconds: _active.inMilliseconds / 1000,
+      notes: notes,
+    );
     notifyListeners();
   }
 

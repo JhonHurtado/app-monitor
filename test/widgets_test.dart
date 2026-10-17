@@ -1,9 +1,11 @@
 import 'package:arbol_monitor/app.dart';
 import 'package:arbol_monitor/data/models.dart';
 import 'package:arbol_monitor/ui/history_page.dart';
+import 'package:arbol_monitor/ui/live_session_page.dart';
 import 'package:arbol_monitor/ui/monitor_page.dart';
 import 'package:arbol_monitor/ui/settings_page.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'helpers.dart';
@@ -32,7 +34,11 @@ void main() {
   }
 
   /// Emite lecturas del acelerómetro mientras avanza el reloj de la prueba.
-  Future<void> feed(WidgetTester tester, Duration total, {double lateral = 0}) async {
+  Future<void> feed(
+    WidgetTester tester,
+    Duration total, {
+    double lateral = 0,
+  }) async {
     // Marca de tiempo sintética: el reloj de la prueba no avanza DateTime.now().
     const step = Duration(milliseconds: 50);
     for (var t = Duration.zero; t < total; t += step) {
@@ -74,15 +80,27 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('Obligatorio'), findsOneWidget);
 
-    await tester.enterText(find.widgetWithText(TextFormField, 'Nombre o código *'), 'Ceiba-07');
-    await tester.enterText(find.widgetWithText(TextFormField, 'Especie'), 'Ceiba pentandra');
+    await tester.enterText(
+      find.widgetWithText(TextFormField, 'Nombre o código *'),
+      'Ceiba-07',
+    );
+    await tester.enterText(
+      find.widgetWithText(TextFormField, 'Especie'),
+      'Ceiba pentandra',
+    );
     await tester.enterText(find.widgetWithText(TextFormField, 'Latitud'), '95');
     await tester.tap(find.text('Guardar'));
     await tester.pumpAndSettle();
     expect(find.text('Debe estar entre -90 y 90'), findsOneWidget);
 
-    await tester.enterText(find.widgetWithText(TextFormField, 'Latitud'), '4,6');
-    await tester.enterText(find.widgetWithText(TextFormField, 'Longitud'), '-74,08');
+    await tester.enterText(
+      find.widgetWithText(TextFormField, 'Latitud'),
+      '4,6',
+    );
+    await tester.enterText(
+      find.widgetWithText(TextFormField, 'Longitud'),
+      '-74,08',
+    );
     await tester.ensureVisible(find.text('Guardar'));
     await tester.tap(find.text('Guardar'));
     await tester.pumpAndSettle();
@@ -100,7 +118,9 @@ void main() {
     expect(find.textContaining('Ceiba pentandra'), findsOneWidget);
   });
 
-  testWidgets('sensores no disponibles se indican y bloquean la medición', (tester) async {
+  testWidgets('sensores no disponibles se indican y bloquean la medición', (
+    tester,
+  ) async {
     fake.present = {2};
     final id = await addTree(repo);
     await pumpPage(tester, const MonitorPage());
@@ -110,13 +130,76 @@ void main() {
     expect(find.text('Magnetómetro · No disponible'), findsNothing);
 
     await pumpPage(tester, SessionSetupPage(treeId: id));
-    expect(find.textContaining('El acelerómetro no está disponible'), findsOneWidget);
+    expect(
+      find.textContaining('El acelerómetro no está disponible'),
+      findsOneWidget,
+    );
     final start = tester.widget<ButtonStyleButton>(
-        find.ancestor(of: find.text('Iniciar sesión'), matching: find.bySubtype<ButtonStyleButton>()));
+      find.ancestor(
+        of: find.text('Iniciar sesión'),
+        matching: find.bySubtype<ButtonStyleButton>(),
+      ),
+    );
     expect(start.onPressed, isNull);
   });
 
-  testWidgets('flujo completo: calibrar, medir, pausar, reanudar y finalizar', (tester) async {
+  testWidgets('el sonido de alerta se reproduce solo al cruzar el umbral', (
+    tester,
+  ) async {
+    final tree = await addTree(repo);
+    final sessionId = await repo.createSession(
+      Session(
+        treeId: tree,
+        startedAt: DateTime.now(),
+        samplingHz: 20,
+        calibration: vertical().toJson(),
+      ),
+    );
+    final sounds = <Object?>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (call) async {
+        if (call.method == 'SystemSound.play') sounds.add(call.arguments);
+        return null;
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: LiveSessionPage(
+          sessionId: sessionId,
+          treeCode: 'A-1',
+          reference: vertical(),
+          hz: 20,
+        ),
+      ),
+    );
+    fake.acc.add(leaning(16, DateTime.now()));
+    await tester.pump();
+    expect(sounds, hasLength(1));
+    expect(
+      find.textContaining('recomienda una inspección profesional'),
+      findsOneWidget,
+    );
+
+    for (var i = 1; i <= 5; i++) {
+      fake.acc.add(
+        leaning(16, DateTime.now().add(Duration(milliseconds: i * 150))),
+      );
+      await tester.pump(const Duration(milliseconds: 150));
+    }
+    expect(sounds, hasLength(1));
+  });
+
+  testWidgets('flujo completo: calibrar, medir, pausar, reanudar y finalizar', (
+    tester,
+  ) async {
     final id = await addTree(repo, 'Roble-01');
     await pumpPage(tester, SessionSetupPage(treeId: id));
     expect(find.text('Calibra la referencia.'), findsOneWidget);
@@ -138,7 +221,11 @@ void main() {
     expect(find.text('Δ lateral'), findsWidgets);
     final session = (await repo.sessions()).single;
     expect(session.status, SessionStatus.running);
-    expect(await repo.sampleCount(session.id!), greaterThan(0), reason: 'lotes escritos cada segundo');
+    expect(
+      await repo.sampleCount(session.id!),
+      greaterThan(0),
+      reason: 'lotes escritos cada segundo',
+    );
 
     await tester.tap(find.text('Pausar'));
     await tester.pump();
@@ -153,7 +240,12 @@ void main() {
     await tester.tap(find.text('Finalizar'));
     await tester.pumpAndSettle();
     await tester.enterText(find.byType(TextField).last, 'Prueba de campo');
-    await tester.tap(find.descendant(of: find.byType(AlertDialog), matching: find.text('Finalizar')));
+    await tester.tap(
+      find.descendant(
+        of: find.byType(AlertDialog),
+        matching: find.text('Finalizar'),
+      ),
+    );
     await tester.pumpAndSettle();
 
     final done = (await repo.session(session.id!))!;
@@ -162,19 +254,39 @@ void main() {
     expect(done.summary!['finalDeltaLateralDeg'], closeTo(1, 0.05));
     expect(find.text('Datos de la sesión'), findsOneWidget);
     expect(fake.screenOn, isFalse);
-    expect(fake.acc.hasListener, isFalse, reason: 'sensores liberados al terminar');
+    expect(
+      fake.acc.hasListener,
+      isFalse,
+      reason: 'sensores liberados al terminar',
+    );
   });
 
   testWidgets('eliminar una sesión requiere confirmación', (tester) async {
     final tree = await addTree(repo);
-    final id = await repo.createSession(Session(
-        treeId: tree, startedAt: DateTime(2026, 5, 1), samplingHz: 20, calibration: vertical().toJson()));
+    final id = await repo.createSession(
+      Session(
+        treeId: tree,
+        startedAt: DateTime(2026, 5, 1),
+        samplingHz: 20,
+        calibration: vertical().toJson(),
+      ),
+    );
     await repo.closeSession(id, SessionStatus.completed);
-    await tester.pumpWidget(MaterialApp(
+    await tester.pumpWidget(
+      MaterialApp(
         home: Builder(
-            builder: (c) => TextButton(
-                onPressed: () => Navigator.push(c, MaterialPageRoute(builder: (_) => SessionDetailPage(sessionId: id))),
-                child: const Text('abrir')))));
+          builder: (c) => TextButton(
+            onPressed: () => Navigator.push(
+              c,
+              MaterialPageRoute(
+                builder: (_) => SessionDetailPage(sessionId: id),
+              ),
+            ),
+            child: const Text('abrir'),
+          ),
+        ),
+      ),
+    );
     await tester.tap(find.text('abrir'));
     await tester.pumpAndSettle();
 
@@ -192,7 +304,9 @@ void main() {
     expect(find.text('abrir'), findsOneWidget);
   });
 
-  testWidgets('umbrales de alerta vacíos por defecto y validados', (tester) async {
+  testWidgets('umbrales de alerta vacíos por defecto y validados', (
+    tester,
+  ) async {
     await pumpPage(tester, const SettingsPage());
     final fields = find.byType(TextFormField);
     expect(fields, findsNWidgets(3));

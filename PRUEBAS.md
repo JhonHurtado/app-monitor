@@ -60,6 +60,10 @@ mesa para las pruebas de banco) y, si es posible, un nivel de burbuja o una app 
 1. Filtra por árbol y por rango de fechas, y activa "Solo incompletas".
 2. En **Inicio › ⚙**, define un umbral de variación (por ejemplo 0,5°). Mide inclinando el soporte y
    comprueba que el mensaje describe el dato sin hacer interpretaciones. Vacía el campo y la alerta debe desaparecer.
+   Durante una sesión en vivo, supera el umbral operativo de 15° respecto a la calibración:
+   debe aparecer el aviso visual y sonar una vez al cruzarlo. Vuelve por debajo y supéralo
+   de nuevo para verificar que el sonido se repite solo en el nuevo cruce. El volumen del
+   dispositivo debe estar habilitado.
 3. Exporta y comparte por correo o guarda en Drive. Abre `sesiones.csv` en una hoja de cálculo y
    `datos.json` en un editor. Comprueba las unidades y que el número de filas de `muestras.csv` coincide con el de muestras.
 4. Elimina una sesión: debe pedir confirmación y desaparecer junto con sus muestras.

@@ -18,7 +18,7 @@ visuales manuales. Funciona sin conexión: todos los datos quedan en el teléfon
 | Sesiones | Frecuencia de 10, 20 o 50 Hz. Registro de colocación y viento. Pausa, reanudación y finalización. Escritura por lotes cada 1 s. Pausa automática al salir de la app. Recuperación de sesiones interrumpidas al arrancar. |
 | Historial | Filtros por árbol, fechas e incompletas. Gráficas de evolución de inclinación y movimiento. Detalle con mínimos, máximos, medias, σ y valores inicial/final. Notas, comparación entre dos sesiones y borrado con confirmación. |
 | Inspecciones | Hojas, ramas, tronco (grietas y desprendimientos), copa, hongos o plagas, inclinación visible, observaciones y fotos. Comparación lado a lado entre fechas. |
-| Alertas | Tres umbrales configurables, **desactivados por defecto**. Los mensajes solo describen el dato, por ejemplo: "La inclinación registrada difiere 2,5° de la referencia". |
+| Alertas | Aviso en vivo si la inclinación medida cambia ≥15° respecto a la calibración, más tres umbrales históricos configurables (desactivados por defecto). El aviso describe la lectura y recomienda inspección; no diagnostica riesgo de caída. |
 | Exportación | `sesiones.csv`, `muestras.csv` y `datos.json` mediante el menú Compartir de Android. Se puede exportar el filtro actual o una sola sesión. |
 
 ## Requisitos e instalación
@@ -66,6 +66,7 @@ lib/
     device.dart             fuentes de sensores (sensors_plus + canal nativo)
     recorder.dart           grabación de sesión: suscripciones, lotes, pausa/reanudación
   analysis/
+    anomaly_model.dart      ventana de 20 muestras y canal de inferencia TFLite Android
     summary.dart            estadísticas, resumen de sesión y calidad de la medición
     alerts.dart             alertas descriptivas por umbral
   data/
@@ -75,8 +76,33 @@ lib/
     export.dart             CSV / JSON y compartir
   ui/                       pantallas (inicio, árboles, monitoreo, sesión en vivo,
                             historial, inspecciones, ajustes) y widgets comunes
-android/.../MainActivity.kt canal nativo: lista de sensores y pantalla encendida
+android/.../MainActivity.kt canal nativo: sensores, pantalla encendida e inferencia TFLite
 ```
+
+### Modelo experimental de anomalías
+
+Durante una sesión Android, la app toma una ventana nueva cada 2 s de 20 lecturas del
+acelerómetro (10 Hz), convierte m/s² a unidades de g y ejecuta
+`android/app/src/main/assets/centinela_forestal.tflite` localmente. El runtime Android
+incluye TensorFlow Lite Select Ops porque el modelo LSTM los requiere. Una puntuación
+superior a 0,85 debe repetirse en cinco ventanas consecutivas (aprox. 10 s) antes de
+mostrar la señal sostenida. Una ventana por debajo del umbral reinicia el contador. La
+grabación continúa si falla la inferencia.
+
+En paralelo e independientemente del modelo, durante la sesión se muestra un aviso
+cuando la inclinación medida del teléfono cambia 15° o más respecto a la calibración.
+El aviso recomienda revisar la fijación e inspeccionar el árbol profesionalmente. Es
+un umbral operativo de la app, no un límite validado de seguridad estructural.
+
+**No interpreta la puntuación como riesgo latente de caída.** `entrenamiento.py` crea
+la clase sintética positiva sumando `sin(3°)` al eje X de ventanas originales. El script
+valida separando árboles para evitar que ventanas del mismo árbol queden en ambos grupos;
+la última validación agrupada obtuvo precision y exactitud de 0,50 para distinguir esa
+transformación (azar). No contiene ejemplos etiquetados de árboles en riesgo ni caídas
+reales. El entrenamiento no representa
+la dinámica mecánica completa del colapso de un árbol ni está validado para decisiones de
+seguridad. El resultado no reemplaza una inspección profesional, y una puntuación baja no
+descarta peligro.
 
 La lectura de sensores (`sensors/`), el cálculo (`analysis/`, `tilt.dart`), la persistencia
 (`data/`) y la interfaz (`ui/`) están separados. No hay gestor de estado ni router: se usan
@@ -88,6 +114,7 @@ añadía carpetas y abstracciones sin beneficio para un MVP de este tamaño.
 
 `sensors_plus` (sensores), `sqflite` (SQLite), `fl_chart` (gráficas), `geolocator` (GPS),
 `image_picker` (fotos), `share_plus` (exportar), `path_provider`, `path`.
+En Android, la inferencia usa `tensorflow-lite` y `tensorflow-lite-select-tf-ops`.
 En desarrollo: `sqflite_common_ffi` (BD en memoria para las pruebas).
 Se eligió `sqflite` en lugar de Drift para evitar la generación de código. Las migraciones se
 gestionan con una lista ordenada de pasos SQL en `data/db.dart`.
